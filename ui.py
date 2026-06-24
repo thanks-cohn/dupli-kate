@@ -1,76 +1,155 @@
+from __future__ import annotations
+
 import math
 import os
 import subprocess
 from datetime import datetime
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QTableView, QVBoxLayout, QWidget
+    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 )
 
-from cache import load_thumbnail
+from cache import thumbnail_cache
 from export import export_csv, export_jsonl, export_sqlite
+from models import Asset, HashGroup
 from scanner import ScanWorker, sha256_file
 
 PAGE_SIZE = 50
+SMALL_THUMBNAIL = 160
 
 
-class AssetTableModel(QAbstractTableModel):
-    headers = ["Filename", "Size", "Duplicates", "Modified", "Hash", "Path"]
-
-    def __init__(self):
-        super().__init__()
-        self.assets = []
-
-    def set_assets(self, assets):
-        self.beginResetModel()
-        self.assets = assets
-        self.endResetModel()
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.assets)
-
-    def columnCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.headers)
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
-            return None
-        asset = self.assets[index.row()]
-        col = index.column()
-        if col == 0:
-            return asset.filename
-        if col == 1:
-            return f"{asset.size:,}"
-        if col == 2:
-            return str(asset.duplicate_count)
-        if col == 3:
-            return datetime.fromtimestamp(asset.modified_time).strftime("%Y-%m-%d %H:%M")
-        if col == 4:
-            return asset.hash[:16] if asset.hash else ""
-        return asset.path
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.headers[section]
-        return None
+class ThumbnailSignals(QObject):
+    loaded = Signal(str, int, QImage)
 
 
-class PreviewSignals(QObject):
-    loaded = Signal(str, QImage)
-
-
-class PreviewJob(QRunnable):
-    def __init__(self, path, size):
+class ThumbnailJob(QRunnable):
+    def __init__(self, path: str, size: int):
         super().__init__()
         self.path = path
         self.size = size
-        self.signals = PreviewSignals()
+        self.signals = ThumbnailSignals()
 
     def run(self):
-        self.signals.loaded.emit(self.path, load_thumbnail(self.path, self.size))
+        self.signals.loaded.emit(self.path, self.size, thumbnail_cache.get(self.path, self.size))
+
+
+class PathTree(QWidget):
+    def __init__(self, asset: Asset):
+        super().__init__()
+        self.asset = asset
+        self.expanded = False
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        self.arrow = QPushButton("▶")
+        self.arrow.setFixedWidth(28)
+        self.arrow.clicked.connect(self.toggle)
+        self.path_label = QLabel(asset.path)
+        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        top.addWidget(self.arrow)
+        top.addWidget(self.path_label, 1)
+        root.addLayout(top)
+        self.details = QWidget()
+        detail_layout = QVBoxLayout(self.details)
+        detail_layout.setContentsMargins(28, 0, 0, 0)
+        for depth, part in enumerate(asset.path_parts):
+            detail_layout.addWidget(QLabel(f"{'  ' * depth}{part}"))
+        self.details.hide()
+        root.addWidget(self.details)
+
+    def toggle(self):
+        self.expanded = not self.expanded
+        self.arrow.setText("▼" if self.expanded else "▶")
+        self.details.setVisible(self.expanded)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            subprocess.Popen(["xdg-open", os.path.dirname(self.asset.path)])
+        elif event.button() == Qt.MouseButton.RightButton:
+            QGuiApplication.clipboard().setText(self.asset.path)
+
+
+class ThumbnailLabel(QLabel):
+    clicked = Signal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
+class Card(QFrame):
+    request_thumbnail = Signal(str, int, object)
+
+    def __init__(self, thumb_path: str):
+        super().__init__()
+        self.thumb_path = thumb_path
+        self.thumb_size = SMALL_THUMBNAIL
+        self.expanded = False
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet("QFrame { border: 1px solid #777; border-radius: 6px; } QLabel { border: 0; }")
+        self.preview = ThumbnailLabel("Loading preview…")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setFixedSize(SMALL_THUMBNAIL, SMALL_THUMBNAIL)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.preview.clicked.connect(self.toggle_preview)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.request_thumbnail.emit(self.thumb_path, self.thumb_size, self)
+
+    def toggle_preview(self):
+        self.expanded = not self.expanded
+        self.thumb_size = max(500, self.window().width() // 2) if self.expanded else SMALL_THUMBNAIL
+        self.preview.setFixedSize(self.thumb_size, self.thumb_size)
+        self.preview.setText("Loading preview…")
+        self.preview.setPixmap(QPixmap())
+        self.request_thumbnail.emit(self.thumb_path, self.thumb_size, self)
+
+    def set_thumbnail(self, image: QImage):
+        if image.isNull():
+            self.preview.setText("Preview\nUnavailable")
+            return
+        self.preview.setText("")
+        self.preview.setPixmap(QPixmap.fromImage(image))
+
+
+class DuplicateCard(Card):
+    def __init__(self, group: HashGroup):
+        super().__init__(group.thumbnail_path)
+        layout = QHBoxLayout(self)
+        left = QVBoxLayout()
+        title = QLabel(f"SHA256: {group.hash}")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        left.addWidget(title)
+        left.addWidget(QLabel(f"Duplicate count: {group.duplicate_count}   Size: {group.size:,} bytes"))
+        for asset in group.assets:
+            left.addWidget(PathTree(asset))
+        left.addStretch()
+        layout.addLayout(left, 1)
+        layout.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignTop)
+
+
+class AssetCard(Card):
+    def __init__(self, asset: Asset):
+        super().__init__(asset.path)
+        layout = QHBoxLayout(self)
+        left = QVBoxLayout()
+        title = QLabel(asset.filename)
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        left.addWidget(title)
+        left.addWidget(QLabel(f"Size: {asset.size:,} bytes   Modified: {format_time(asset.modified_time)}"))
+        left.addWidget(PathTree(asset))
+        left.addStretch()
+        layout.addLayout(left, 1)
+        layout.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignTop)
+
+
+def format_time(value: float) -> str:
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S") if value else ""
 
 
 class MainWindow(QMainWindow):
@@ -79,179 +158,178 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CloneTree")
         self.resize(1200, 800)
         self.mode = "duplicates"
-        self.assets = []
-        self.filtered = []
+        self.items: list[HashGroup] | list[Asset] = []
+        self.filtered: list[HashGroup] | list[Asset] = []
         self.page = 0
-        self.worker = None
+        self.worker: ScanWorker | None = None
         self.pool = QThreadPool.globalInstance()
+        self.cards: list[Card] = []
+        self._progressive_since_render = 0
 
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-
         top = QHBoxLayout()
         self.duplicates = QPushButton("Scan Duplicates")
         self.explore = QPushButton("Explore")
+        self.snapshot = QPushButton("Snapshot / Export")
         self.search = QLineEdit(placeholderText="Search filename, path, or hash prefix")
         self.sort = QComboBox()
         self.sort.addItems(["Duplicate count", "Filename", "Size", "Modified date"])
-        top.addWidget(self.duplicates)
-        top.addWidget(self.explore)
-        top.addWidget(self.search, 1)
-        top.addWidget(QLabel("Sort:"))
-        top.addWidget(self.sort)
+        for widget in (self.duplicates, self.explore, self.snapshot, self.search, QLabel("Sort:"), self.sort):
+            top.addWidget(widget, 1 if widget is self.search else 0)
         layout.addLayout(top)
-
-        self.status = QLabel("Choose a folder to begin.")
+        self.status = QLabel("Choose a folder to begin. Left-click a path to open its folder. Right-click a path to copy it.")
         layout.addWidget(self.status)
-
-        self.table = QTableView()
-        self.model = AssetTableModel()
-        self.table.setModel(self.model)
-        self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
-        self.table.doubleClicked.connect(self.open_folder)
-        layout.addWidget(self.table, 1)
-
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.card_layout = QVBoxLayout(self.container)
+        self.card_layout.addStretch()
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll, 1)
         bottom = QHBoxLayout()
         self.prev = QPushButton("Previous Page")
         self.page_label = QLabel("Page 0 / 0")
         self.next = QPushButton("Next Page")
-        self.preview = QPushButton("Click To Preview")
-        self.preview_label = QLabel("[ Click To Preview ]")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(180, 180)
-        self.copy = QPushButton("Copy Path")
-        self.export_jsonl = QPushButton("Export JSONL")
-        self.export_csv = QPushButton("Export CSV")
-        self.export_sqlite = QPushButton("Export SQLite")
-        for widget in (self.prev, self.page_label, self.next, self.preview, self.preview_label, self.copy,
-                       self.export_jsonl, self.export_csv, self.export_sqlite):
-            bottom.addWidget(widget)
+        bottom.addStretch(); bottom.addWidget(self.prev); bottom.addWidget(self.page_label); bottom.addWidget(self.next); bottom.addStretch()
         layout.addLayout(bottom)
 
         self.duplicates.clicked.connect(lambda: self.start_scan("duplicates"))
         self.explore.clicked.connect(lambda: self.start_scan("explore"))
+        self.snapshot.clicked.connect(self.save_export)
         self.search.textChanged.connect(self.apply_filter)
         self.sort.currentTextChanged.connect(self.apply_filter)
         self.prev.clicked.connect(lambda: self.change_page(-1))
         self.next.clicked.connect(lambda: self.change_page(1))
-        self.preview.clicked.connect(lambda: self.load_preview(180))
-        self.preview_label.mousePressEvent = lambda event: self.load_preview(520)
-        self.copy.clicked.connect(self.copy_path)
-        self.export_jsonl.clicked.connect(lambda: self.save_export("jsonl"))
-        self.export_csv.clicked.connect(lambda: self.save_export("csv"))
-        self.export_sqlite.clicked.connect(lambda: self.save_export("sqlite"))
 
-    def start_scan(self, mode):
+    def start_scan(self, mode: str):
         root = QFileDialog.getExistingDirectory(self, "Choose Directory", os.path.expanduser("~"))
         if not root:
             return
         if self.worker and self.worker.isRunning():
-            self.worker.stop()
+            self.worker.stop(); self.worker.wait(1000)
         self.mode = mode
-        self.assets = []
+        self.items = []
         self.filtered = []
         self.page = 0
         self.render_page()
-        self.status.setText(f"Scanning {root}...")
+        self.status.setText(f"Scanning {root}…")
         self.worker = ScanWorker(root, mode)
+        self.worker.asset_found.connect(self.add_progressive_item)
+        self.worker.group_found.connect(self.add_progressive_item)
         self.worker.progress.connect(self.show_progress)
         self.worker.finished.connect(self.scan_finished)
         self.worker.failed.connect(lambda text: QMessageBox.critical(self, "Scan failed", text))
         self.worker.start()
 
-    def show_progress(self, scanned, groups, path, elapsed):
-        label = "duplicate groups" if self.mode == "duplicates" else "size groups"
-        self.status.setText(f"Files scanned: {scanned:,} | {label}: {groups:,} | Elapsed: {elapsed:.1f}s | {path}")
+    def add_progressive_item(self, item: object):
+        self.items.append(item)
+        self._progressive_since_render += 1
+        if len(self.items) == 1 or self._progressive_since_render >= 25:
+            self._progressive_since_render = 0
+            self.apply_filter(keep_page=True)
 
-    def scan_finished(self, assets):
-        self.assets = assets
-        self.status.setText(f"Loaded {len(assets):,} assets in {self.mode} mode.")
+    def show_progress(self, scanned: int, groups: int, path: str, elapsed: float):
+        label = "duplicate groups found" if self.mode == "duplicates" else "assets found"
+        found = groups if self.mode == "duplicates" else len(self.items)
+        self.status.setText(f"Files scanned: {scanned:,} | {label}: {found:,} | Current file: {path} | Elapsed: {elapsed:.1f}s")
+
+    def scan_finished(self, items: object):
+        self.items = list(items)
         self.apply_filter()
+        self.status.setText(f"Scan complete. Showing {len(self.filtered):,} {self.mode} results.")
 
-    def apply_filter(self):
+    def apply_filter(self, keep_page: bool = False):
         text = self.search.text().casefold()
+        data = list(self.items)
         if text:
-            self.filtered = [a for a in self.assets if text in a.filename.casefold() or text in a.path.casefold() or a.hash.casefold().startswith(text)]
-        else:
-            self.filtered = list(self.assets)
+            data = [item for item in data if self.matches(item, text)]
         key = self.sort.currentText()
-        if key == "Filename":
-            self.filtered.sort(key=lambda a: a.filename.casefold())
-        elif key == "Size":
-            self.filtered.sort(key=lambda a: a.size, reverse=True)
-        elif key == "Modified date":
-            self.filtered.sort(key=lambda a: a.modified_time, reverse=True)
-        else:
-            self.filtered.sort(key=lambda a: (a.duplicate_count, a.size), reverse=True)
-        self.page = 0
+        reverse = key != "Filename"
+        data.sort(key=lambda item: self.sort_value(item, key), reverse=reverse)
+        self.filtered = data
+        if not keep_page:
+            self.page = 0
         self.render_page()
 
+    def matches(self, item: HashGroup | Asset, text: str) -> bool:
+        if isinstance(item, HashGroup):
+            return item.hash.casefold().startswith(text) or any(text in a.filename.casefold() or text in a.path.casefold() for a in item.assets)
+        return text in item.filename.casefold() or text in item.path.casefold() or item.hash.casefold().startswith(text)
+
+    def sort_value(self, item: HashGroup | Asset, key: str):
+        if key == "Filename":
+            return item.filename.casefold()
+        if key == "Size":
+            return item.size
+        if key == "Modified date":
+            return item.modified_time
+        return (item.duplicate_count if isinstance(item, HashGroup) else item.duplicate_count, item.size)
+
     def render_page(self):
+        while self.card_layout.count() > 1:
+            child = self.card_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.cards = []
         pages = max(1, math.ceil(len(self.filtered) / PAGE_SIZE))
         self.page = min(self.page, pages - 1)
         start = self.page * PAGE_SIZE
-        self.model.set_assets(self.filtered[start:start + PAGE_SIZE])
-        self.table.resizeColumnsToContents()
-        self.page_label.setText(f"Page {self.page + 1 if self.filtered else 0} / {pages if self.filtered else 0}")
+        for item in self.filtered[start:start + PAGE_SIZE]:
+            card = DuplicateCard(item) if isinstance(item, HashGroup) else AssetCard(item)
+            card.request_thumbnail.connect(self.load_thumbnail)
+            self.cards.append(card)
+            self.card_layout.insertWidget(self.card_layout.count() - 1, card)
+        visible_page = self.page + 1 if self.filtered else 0
+        total_pages = pages if self.filtered else 0
+        self.page_label.setText(f"Page {visible_page} / {total_pages} ({len(self.filtered):,} results)")
         self.prev.setEnabled(self.page > 0)
-        self.next.setEnabled(self.page < pages - 1 and bool(self.filtered))
-        self.preview_label.setText("[ Click To Preview ]")
-        self.preview_label.setPixmap(QPixmap())
+        self.next.setEnabled(bool(self.filtered) and self.page < pages - 1)
 
-    def change_page(self, delta):
+    def change_page(self, delta: int):
         self.page += delta
         self.render_page()
+        self.scroll.verticalScrollBar().setValue(0)
 
-    def selected_asset(self):
-        rows = self.table.selectionModel().selectedRows()
-        return self.model.assets[rows[0].row()] if rows else None
-
-    def load_preview(self, size):
-        asset = self.selected_asset()
-        if not asset:
-            return
-        self.preview_label.setText("Loading preview...")
-        job = PreviewJob(asset.path, size)
-        job.signals.loaded.connect(self.preview_loaded)
+    def load_thumbnail(self, path: str, size: int, card: Card):
+        job = ThumbnailJob(path, size)
+        job.signals.loaded.connect(lambda loaded_path, loaded_size, image: self.thumbnail_loaded(loaded_path, loaded_size, image, card))
         self.pool.start(job)
 
-    def preview_loaded(self, path, image):
-        asset = self.selected_asset()
-        if not asset or asset.path != path:
-            return
-        if image.isNull():
-            self.preview_label.setText("Preview unavailable")
-        else:
-            self.preview_label.setPixmap(QPixmap.fromImage(image))
+    def thumbnail_loaded(self, path: str, size: int, image: QImage, card: Card):
+        if card in self.cards and card.thumb_path == path and card.thumb_size == size:
+            card.set_thumbnail(image)
 
-    def open_folder(self):
-        asset = self.selected_asset()
-        if asset:
-            subprocess.Popen(["xdg-open", os.path.dirname(asset.path)])
-
-    def copy_path(self):
-        asset = self.selected_asset()
-        if asset:
-            QGuiApplication.clipboard().setText(asset.path)
-
-    def save_export(self, kind):
-        suffix = {"jsonl": "JSONL (*.jsonl)", "csv": "CSV (*.csv)", "sqlite": "SQLite (*.sqlite)"}[kind]
-        path, _ = QFileDialog.getSaveFileName(self, "Export", f"{self.mode}.{kind}", suffix)
+    def save_export(self):
+        filters = "JSONL (*.jsonl);;CSV (*.csv);;SQLite (*.sqlite)"
+        path, selected = QFileDialog.getSaveFileName(self, "Snapshot / Export", f"{self.mode}_snapshot.jsonl", filters)
         if not path:
             return
-        self.hash_for_export()
-        funcs = {"jsonl": export_jsonl, "csv": export_csv, "sqlite": export_sqlite}
-        funcs[kind](path, self.filtered)
-        self.status.setText(f"Exported {len(self.filtered):,} assets to {path}")
+        assets = self.assets_for_export()
+        if selected.startswith("CSV") or path.endswith(".csv"):
+            export_csv(path, assets)
+        elif selected.startswith("SQLite") or path.endswith((".sqlite", ".db")):
+            export_sqlite(path, assets)
+        else:
+            export_jsonl(path, assets)
+        self.status.setText(f"Exported {len(assets):,} assets to {path}")
 
-    def hash_for_export(self):
-        missing = [asset for asset in self.filtered if not asset.hash]
-        for index, asset in enumerate(missing, 1):
+    def assets_for_export(self) -> list[Asset]:
+        assets: list[Asset] = []
+        for item in self.filtered:
+            assets.extend(item.assets if isinstance(item, HashGroup) else [item])
+        for index, asset in enumerate([a for a in assets if not a.hash], 1):
             try:
                 asset.hash = sha256_file(asset.path)
             except OSError:
                 asset.hash = ""
             if index % 25 == 0:
-                self.status.setText(f"Hashing for export: {index:,} / {len(missing):,}")
+                self.status.setText(f"Hashing for export: {index:,}")
+                QGuiApplication.processEvents()
+        return assets
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop(); self.worker.wait(1000)
+        super().closeEvent(event)
